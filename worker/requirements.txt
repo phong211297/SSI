@@ -1,0 +1,20 @@
+# ─── Core ─────────────────────────────────────────────────────────────────────
+psycopg2-binary==2.9.10
+redis==5.2.1
+httpx==0.28.1            # HTTP client (async)
+python-dotenv==1.0.1
+
+# ─── Scheduler ────────────────────────────────────────────────────────────────
+apscheduler==3.10.4
+
+# ─── Data Processing ──────────────────────────────────────────────────────────
+pandas==2.2.3
+pandas-ta==0.3.14b       # Technical indicators (RSI, MACD, Bollinger, etc.)
+numpy==1.26.4
+
+# ─── AI / Embeddings ──────────────────────────────────────────────────────────
+openai==1.68.2           # text-embedding-3-small
+
+# ─── News Crawling ────────────────────────────────────────────────────────────
+beautifulsoup4==4.13.3
+feedparser==6.0.11       # RSS feeds

@@ -1,7 +1,17 @@
-// SSE endpoint: stream real-time price updates
-// Poll VNDirect mỗi 5 giây, push event xuống client
+/**
+ * GET /api/stream — Server-Sent Events (SSE) real-time price updates
+ *
+ * Upgrade từ:  Next.js polling VNDirect mỗi 5s cho MỖI client
+ * Lên:         Redis Pub/Sub — Worker publish 1 lần, N clients đều nhận
+ *
+ * Flow:
+ *   Worker (crawl_prices) → Redis PUBLISH "price-updates" → SSE push → Client
+ */
 
-const VNDIRECT_API = 'https://finfo-api.vndirect.com.vn/v4';
+import { createSubscriber, getCachedPrices, PRICE_CHANNEL } from '@/lib/redis';
+import type { Redis as RedisType } from 'ioredis';
+
+export const dynamic = 'force-dynamic';
 
 const DEFAULT_TICKERS = [
   'VNM','VCB','HPG','VIC','VHM','TCB','MBB','FPT','MSN','GAS',
@@ -10,93 +20,91 @@ const DEFAULT_TICKERS = [
 
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
-  const tickers = (searchParams.get('tickers') || DEFAULT_TICKERS.join(',')).split(',');
+  const tickerParam = searchParams.get('tickers');
+  const tickers = tickerParam
+    ? tickerParam.split(',').map((t) => t.trim().toUpperCase()).slice(0, 50)
+    : DEFAULT_TICKERS;
 
   const encoder = new TextEncoder();
+  let subscriber: RedisType | null = null;
 
   const stream = new ReadableStream({
     async start(controller) {
-      let active = true;
-
-      // Gửi heartbeat ngay khi connect
-      controller.enqueue(encoder.encode(': connected\n\n'));
-
-      const fetchAndSend = async () => {
-        if (!active) return;
+      const send = (data: object) => {
         try {
-          const prices = await fetchPrices(tickers.slice(0, 20));
-          const data = `data: ${JSON.stringify({ prices, timestamp: Date.now() })}\n\n`;
-          controller.enqueue(encoder.encode(data));
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
         } catch {
-          // silent fail — keep streaming
+          // Client đã disconnect
         }
       };
 
-      // Gửi ngay lần đầu
-      await fetchAndSend();
+      // ─── 1. Gửi giá hiện tại ngay khi connect (từ Redis cache) ────────────
+      try {
+        const initialPrices = await getCachedPrices(tickers);
+        const priceList = Object.values(initialPrices);
+        if (priceList.length > 0) {
+          send({ prices: priceList, timestamp: Date.now(), source: 'cache' });
+        }
+      } catch {
+        // Cache chưa có — worker chưa chạy lần đầu, bỏ qua
+      }
 
-      // Poll mỗi 5 giây
-      const interval = setInterval(fetchAndSend, 5000);
+      // ─── 2. Subscribe Redis channel để nhận updates real-time ────────────
+      subscriber = createSubscriber();
 
-      // Cleanup khi client disconnect
+      if (subscriber) {
+        subscriber.subscribe(PRICE_CHANNEL).catch((err: Error) => {
+          console.error('[SSE] Redis subscribe error:', err.message);
+        });
+
+        subscriber.on('message', (_channel: string, message: string) => {
+          try {
+            const data = JSON.parse(message);
+
+            // Filter chỉ các mã client đang theo dõi
+            const filtered = (data.prices as Array<{ code: string }>)?.filter(
+              (p) => tickers.includes(p.code),
+            );
+
+            if (filtered?.length) {
+              send({ prices: filtered, timestamp: data.timestamp, source: 'realtime' });
+            }
+          } catch {
+            // Malformed message — bỏ qua
+          }
+        });
+      }
+
+      // ─── 3. Heartbeat mỗi 30s để giữ connection sống ────────────────────
+      const heartbeat = setInterval(() => {
+        try {
+          controller.enqueue(encoder.encode(': heartbeat\n\n'));
+        } catch {
+          clearInterval(heartbeat);
+        }
+      }, 30_000);
+
+      // ─── 4. Cleanup khi client disconnect ────────────────────────────────
       req.signal.addEventListener('abort', () => {
-        active = false;
-        clearInterval(interval);
-        controller.close();
+        clearInterval(heartbeat);
+        subscriber?.disconnect();
+        subscriber = null;
+        try { controller.close(); } catch { /* already closed */ }
       });
+    },
+
+    cancel() {
+      subscriber?.disconnect();
+      subscriber = null;
     },
   });
 
   return new Response(stream, {
     headers: {
-      'Content-Type': 'text/event-stream',
+      'Content-Type':  'text/event-stream',
       'Cache-Control': 'no-cache, no-transform',
-      'Connection': 'keep-alive',
-      'X-Accel-Buffering': 'no',
+      'Connection':    'keep-alive',
+      'X-Accel-Buffering': 'no',    // Tắt buffering ở nginx/proxy
     },
-  });
-}
-
-async function fetchPrices(tickers: string[]) {
-  const query = tickers.map(t => `code:${t}`).join('~');
-  try {
-    const res = await fetch(
-      `${VNDIRECT_API}/stockPrices?sort=-date&q=${encodeURIComponent(query)}&size=${tickers.length}`,
-      {
-        headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' },
-        signal: AbortSignal.timeout(4000),
-      }
-    );
-    if (!res.ok) return generateSimulatedPrices(tickers);
-    const json = await res.json();
-    return json.data ?? generateSimulatedPrices(tickers);
-  } catch {
-    return generateSimulatedPrices(tickers);
-  }
-}
-
-// Simulate giá khi API không khả dụng (demo purposes)
-const basePrice: Record<string, number> = {
-  VNM: 68000, VCB: 82000, HPG: 26000, VIC: 42000, VHM: 35000,
-  TCB: 22000, MBB: 18500, FPT: 145000, MSN: 78000, GAS: 62000,
-  BID: 41000, CTG: 34000, ACB: 23000, VPB: 19000, STB: 26000,
-  SSI: 28000, VJC: 105000, PLX: 46000, POW: 12000, REE: 58000,
-};
-
-function generateSimulatedPrices(tickers: string[]) {
-  return tickers.map(code => {
-    const base = basePrice[code] ?? 50000;
-    const change = (Math.random() - 0.5) * 0.04; // ±2%
-    const close = Math.round(base * (1 + change) / 100) * 100;
-    const prevClose = base;
-    const pctChange = ((close - prevClose) / prevClose) * 100;
-    return {
-      code,
-      close,
-      pricePreviousClose: prevClose,
-      percentPriceChange: Math.round(pctChange * 100) / 100,
-      nmVolume: Math.round(Math.random() * 5000000),
-      date: new Date().toISOString().split('T')[0],
-    };
   });
 }

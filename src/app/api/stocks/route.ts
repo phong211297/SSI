@@ -1,67 +1,136 @@
-// Proxy đến VNDirect finfo API để lấy danh sách mã chứng khoán
-// Tránh CORS khi gọi từ browser
+/**
+ * GET /api/stocks — Danh sách mã chứng khoán từ DB
+ * Hỗ trợ filter theo sàn, tìm kiếm theo mã/tên, phân trang
+ */
 
-const VNDIRECT_API = 'https://finfo-api.vndirect.com.vn/v4';
+import { query } from '@/lib/db';
+import { getCachedPrices } from '@/lib/redis';
 
-export const revalidate = 300; // cache 5 phút
+export const dynamic = 'force-dynamic';
+
+interface StockRow {
+  ticker: string;
+  company_name: string;
+  industry: string;
+  floor: string;
+  ipo_date: string | null;
+  ipo_price: number | null;
+}
+
+interface PriceRow {
+  close: number;
+  price_previous_close: number;
+  pct_change: number;
+  volume: number;
+}
 
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const exchange = searchParams.get('exchange') || '';
-  const page = searchParams.get('page') || '1';
-  const size = searchParams.get('size') || '50';
-  const search = searchParams.get('q') || '';
-
-  let query = 'type:STOCK';
-  if (exchange) query += `~floor:${exchange}`;
-  if (search) query += `~code:${search}*`;
+  const search   = searchParams.get('q') || '';
+  const page     = Math.max(1, parseInt(searchParams.get('page') || '1', 10));
+  const size     = Math.min(100, parseInt(searchParams.get('size') || '50', 10));
+  const offset   = (page - 1) * size;
 
   try {
-    const url = `${VNDIRECT_API}/stocks?sort=code&q=${encodeURIComponent(query)}&size=${size}&page=${page}`;
-    const res = await fetch(url, {
-      headers: {
-        'Accept': 'application/json',
-        'User-Agent': 'Mozilla/5.0',
-      },
-      next: { revalidate: 300 },
-    });
+    // ─── Build dynamic WHERE clause ─────────────────────────────────────────
+    const conditions: string[] = ['s.is_active = true'];
+    const params: unknown[]    = [];
+    let paramIdx = 1;
 
-    if (!res.ok) {
-      throw new Error(`VNDirect API error: ${res.status}`);
+    if (exchange) {
+      conditions.push(`s.floor = $${paramIdx++}`);
+      params.push(exchange.toUpperCase());
     }
 
-    const data = await res.json();
-    return Response.json(data);
-  } catch (err) {
-    // Fallback: trả về một số mã phổ biến nếu API không hoạt động
-    return Response.json({
-      data: POPULAR_STOCKS,
-      totalRecord: POPULAR_STOCKS.length,
-      isFallback: true,
+    if (search) {
+      conditions.push(`(s.ticker ILIKE $${paramIdx} OR s.company_name ILIKE $${paramIdx})`);
+      params.push(`%${search}%`);
+      paramIdx++;
+    }
+
+    const whereClause = conditions.join(' AND ');
+
+    // ─── Count total (for pagination) ───────────────────────────────────────
+    const countResult = await query<{ total: string }>(
+      `SELECT COUNT(*) as total FROM stocks s WHERE ${whereClause}`,
+      params,
+    );
+    const total = parseInt(countResult[0]?.total || '0', 10);
+
+    // ─── Fetch stocks ────────────────────────────────────────────────────────
+    const stocks = await query<StockRow>(
+      `SELECT ticker, company_name, industry, floor, ipo_date, ipo_price
+       FROM stocks s
+       WHERE ${whereClause}
+       ORDER BY s.ticker ASC
+       LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`,
+      [...params, size, offset],
+    );
+
+    if (!stocks.length) {
+      return Response.json({ data: [], totalRecord: 0, page, size });
+    }
+
+    // ─── Enrich với giá từ Redis cache (fast path) ───────────────────────────
+    const tickers       = stocks.map((s) => s.ticker);
+    const cachedPrices: Record<string, unknown> = await getCachedPrices(tickers).catch(() => ({} as Record<string, unknown>));
+
+    // ─── Fallback: query DB nếu Redis không có ──────────────────────────────
+    const uncachedTickers = tickers.filter((t) => !(cachedPrices as Record<string, unknown>)[t]);
+    let dbPrices: Record<string, PriceRow> = {};
+
+    if (uncachedTickers.length > 0) {
+      const priceRows = await query<PriceRow & { ticker: string }>(
+        `SELECT DISTINCT ON (ticker)
+            ticker,
+            close,
+            (SELECT close FROM stock_prices p2
+             WHERE p2.ticker = p.ticker
+             ORDER BY time DESC
+             LIMIT 1 OFFSET 1) AS price_previous_close,
+            0 AS pct_change,
+            volume
+         FROM stock_prices p
+         WHERE ticker = ANY($1::text[])
+         ORDER BY ticker, time DESC`,
+        [uncachedTickers],
+      ).catch(() => []);
+
+      dbPrices = Object.fromEntries(priceRows.map((r) => [r.ticker, r]));
+    }
+
+    // ─── Merge và format response ────────────────────────────────────────────
+    const data = stocks.map((s) => {
+      const cached  = cachedPrices[s.ticker] as Record<string, number> | undefined;
+      const dbPrice = dbPrices[s.ticker];
+
+      const close           = cached?.close        ?? dbPrice?.close        ?? null;
+      const prevClose       = cached?.pricePreviousClose ?? dbPrice?.price_previous_close ?? null;
+      const percentChange   = cached?.percentPriceChange ?? (
+        close && prevClose && prevClose > 0
+          ? parseFloat((((close - prevClose) / prevClose) * 100).toFixed(2))
+          : null
+      );
+
+      return {
+        code:           s.ticker,
+        floor:          s.floor,
+        companyName:    s.company_name,
+        industryName:   s.industry,
+        close,
+        pricePreviousClose: prevClose,
+        percentPriceChange: percentChange,
+      };
     });
+
+    return Response.json({ data, totalRecord: total, page, size });
+
+  } catch (error) {
+    console.error('[/api/stocks] DB error:', error);
+    return Response.json(
+      { error: 'Failed to fetch stocks' },
+      { status: 500 },
+    );
   }
 }
-
-// Fallback data khi API không khả dụng
-const POPULAR_STOCKS = [
-  { code: 'VNM', floor: 'HOSE', companyName: 'Vinamilk', industryName: 'Thực phẩm' },
-  { code: 'VCB', floor: 'HOSE', companyName: 'Vietcombank', industryName: 'Ngân hàng' },
-  { code: 'HPG', floor: 'HOSE', companyName: 'Hòa Phát', industryName: 'Thép' },
-  { code: 'VIC', floor: 'HOSE', companyName: 'Vingroup', industryName: 'Bất động sản' },
-  { code: 'VHM', floor: 'HOSE', companyName: 'Vinhomes', industryName: 'Bất động sản' },
-  { code: 'TCB', floor: 'HOSE', companyName: 'Techcombank', industryName: 'Ngân hàng' },
-  { code: 'MBB', floor: 'HOSE', companyName: 'MB Bank', industryName: 'Ngân hàng' },
-  { code: 'FPT', floor: 'HOSE', companyName: 'FPT Corporation', industryName: 'Công nghệ' },
-  { code: 'MSN', floor: 'HOSE', companyName: 'Masan Group', industryName: 'Hàng tiêu dùng' },
-  { code: 'GAS', floor: 'HOSE', companyName: 'PV Gas', industryName: 'Dầu khí' },
-  { code: 'BID', floor: 'HOSE', companyName: 'BIDV', industryName: 'Ngân hàng' },
-  { code: 'CTG', floor: 'HOSE', companyName: 'Vietinbank', industryName: 'Ngân hàng' },
-  { code: 'ACB', floor: 'HOSE', companyName: 'ACB', industryName: 'Ngân hàng' },
-  { code: 'VPB', floor: 'HOSE', companyName: 'VPBank', industryName: 'Ngân hàng' },
-  { code: 'STB', floor: 'HOSE', companyName: 'Sacombank', industryName: 'Ngân hàng' },
-  { code: 'SSI', floor: 'HOSE', companyName: 'SSI Securities', industryName: 'Chứng khoán' },
-  { code: 'VJC', floor: 'HOSE', companyName: 'Vietjet Air', industryName: 'Hàng không' },
-  { code: 'PLX', floor: 'HOSE', companyName: 'Petrolimex', industryName: 'Dầu khí' },
-  { code: 'POW', floor: 'HOSE', companyName: 'PV Power', industryName: 'Điện' },
-  { code: 'REE', floor: 'HOSE', companyName: 'REE Corporation', industryName: 'Công nghiệp' },
-];
