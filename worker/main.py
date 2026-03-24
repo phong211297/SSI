@@ -5,9 +5,11 @@ Chạy tất cả jobs theo lịch: giá real-time, chỉ số kỹ thuật, tin
 
 import logging
 import os
+import threading
 import time
 from datetime import datetime
 
+import uvicorn
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
@@ -67,17 +69,28 @@ def main():
         logger.info(f"Waiting {startup_delay}s for dependencies to be ready...")
         time.sleep(startup_delay)
 
+    # ─── Start FastAPI sidecar trong background thread ────────────────────────
+    from api import app as fastapi_app
+
+    api_port = int(os.environ.get("API_PORT", "8000"))
+
+    def run_api():
+        uvicorn.run(fastapi_app, host="0.0.0.0", port=api_port, log_level="warning")
+
+    api_thread = threading.Thread(target=run_api, daemon=True)
+    api_thread.start()
+    logger.info(f"✓ FastAPI sidecar started on port {api_port}")
+
     scheduler = BlockingScheduler(timezone="Asia/Ho_Chi_Minh")
 
     # ─── Giá real-time: mỗi 5 giây (trong giờ giao dịch) ─────────────────────
-    # Note: VNDirect public API cập nhật giá theo phiên nên 5s là đủ
     scheduler.add_job(
         safe_crawl_prices,
         trigger=IntervalTrigger(seconds=5),
         id="price_crawler",
         name="Real-time Price Crawler",
-        max_instances=1,       # Không chạy overlap nếu job trước chưa xong
-        coalesce=True,         # Bỏ qua các lần bị lỡ (ví dụ khi restart)
+        max_instances=1,
+        coalesce=True,
         misfire_grace_time=10,
     )
 
@@ -110,6 +123,7 @@ def main():
     logger.info("━━━ Scheduler started ━━━")
     logger.info("  • Price crawler:       every 5s (trading hours only)")
     logger.info("  • Indicator calc:      every 5min")
+    logger.info(f"  • FastAPI sidecar:    http://0.0.0.0:{api_port}/docs")
     logger.info("Press Ctrl+C to stop")
 
     try:

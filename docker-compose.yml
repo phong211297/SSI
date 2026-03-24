@@ -1,4 +1,35 @@
 services:
+  # ─── Next.js App ──────────────────────────────────────────────────────────────
+  nextjs:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dev
+    container_name: ssi_nextjs
+    restart: unless-stopped
+    ports:
+      - '3000:3000'
+    environment:
+      # Override localhost → Docker service names
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ssi}:${POSTGRES_PASSWORD:-ssi_secret}@postgres:5432/${POSTGRES_DB:-ssi_db}
+      REDIS_URL: redis://redis:6379
+      NEXT_PUBLIC_BASE_URL: http://localhost:3000
+      GOOGLE_AI_API_KEY: ${GOOGLE_AI_API_KEY}
+      WORKER_URL: http://worker:8000
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      NODE_ENV: development
+    volumes:
+      - .:/app
+      - /app/node_modules   # keep container's node_modules, don't override with host
+      - /app/.next          # keep container's .next build cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+
   # ─── PostgreSQL with pgvector extension ───────────────────────────────────
   postgres:
     image: pgvector/pgvector:pg16
@@ -50,6 +81,9 @@ services:
       REDIS_URL: redis://redis:6379
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       ENVIRONMENT: ${ENVIRONMENT:-development}
+      API_PORT: 8000
+    ports:
+      - '8000:8000'
     depends_on:
       postgres:
         condition: service_healthy
@@ -57,6 +91,7 @@ services:
         condition: service_healthy
     volumes:
       - ./worker:/app
+    command: watchmedo auto-restart --patterns="*.py" --recursive -- python main.py
 
 volumes:
   postgres_data:

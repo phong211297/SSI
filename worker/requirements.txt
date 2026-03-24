@@ -1,3 +1,10 @@
+# ─── Dev ──────────────────────────────────────────────────────────────────────
+watchdog[watchmedo]      # Auto-reload worker on file change
+
+# ─── HTTP Sidecar ─────────────────────────────────────────────────────────────
+fastapi==0.115.12
+uvicorn==0.34.0
+
 # ─── Core ─────────────────────────────────────────────────────────────────────
 psycopg2-binary==2.9.10
 redis==5.2.1
@@ -8,9 +15,9 @@ python-dotenv==1.0.1
 apscheduler==3.10.4
 
 # ─── Data Processing ──────────────────────────────────────────────────────────
-pandas==2.2.3
-pandas-ta==0.3.14b       # Technical indicators (RSI, MACD, Bollinger, etc.)
-numpy==1.26.4
+pandas>=2.0.0
+pandas-ta         # Technical indicators (RSI, MACD, Bollinger, etc.) - let pip resolve
+numpy
 
 # ─── AI / Embeddings ──────────────────────────────────────────────────────────
 openai==1.68.2           # text-embedding-3-small

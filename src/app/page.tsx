@@ -14,8 +14,17 @@ export default function Home() {
   const [selectedTicker, setSelectedTicker] = useState('');
   const [livePrices, setLivePrices] = useState<Record<string, any>>({});
   const [chatOpen, setChatOpen] = useState(false);
+  const [currentTime, setCurrentTime] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
   const isLoading = status === 'streaming' || status === 'submitted';
+
+  // Update time ở client để tránh hydration mismatch (server UTC vs client GMT+7)
+  useEffect(() => {
+    const fmt = () => new Date().toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' });
+    setCurrentTime(fmt());
+    const timer = setInterval(() => setCurrentTime(fmt()), 60_000);
+    return () => clearInterval(timer);
+  }, []);
 
   // Sync live prices từ SSE stream
   useEffect(() => {
@@ -62,7 +71,7 @@ export default function Home() {
         </div>
         <div className={styles.topBarRight}>
           <span className={styles.marketTime}>
-            {new Date().toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' })} ICT
+            {currentTime ? `${currentTime} ICT` : ''}
           </span>
           <button
             className={`${styles.chatToggle} ${chatOpen ? styles.active : ''}`}
