@@ -1,0 +1,10 @@
+{
+  "python.analysis.extraPaths": [
+    "./worker"
+  ],
+  "python.autoComplete.extraPaths": [
+    "./worker"
+  ],
+  "python.languageServer": "Pylance",
+  "python.defaultInterpreterPath": "./worker/.venv/Scripts/python.exe"
+}

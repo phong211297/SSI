@@ -18,7 +18,7 @@ interface StockInfo {
 }
 
 interface PriceRow {
-  time: string;
+  time: string | Date;  // pg driver trả về Date object cho timestamp columns
   open: number;
   high: number;
   low: number;
@@ -60,25 +60,28 @@ export async function GET(
       return Response.json({ error: `Mã ${symbol} không tìm thấy` }, { status: 404 });
     }
 
-    // ─── 2. Price history (180 ngày gần nhất) ───────────────────────────────
-    // Kết hợp từ 2 bảng: history (dữ liệu cũ) + stock_prices (dữ liệu mới)
+    // ─── 2. Price history (toàn bộ lịch sử) ────────────────────────────────
+    // UNION để merge history + realtime, DISTINCT ON loại bỏ duplicate cùng ngày
     const history = await query<PriceRow>(
-      `(
-         SELECT time, open, high, low, close, volume
-         FROM stock_prices_history
-         WHERE ticker = $1
-         ORDER BY time DESC
-         LIMIT 180
-       )
-       UNION ALL
-       (
-         SELECT time, open, high, low, close, volume
-         FROM stock_prices
-         WHERE ticker = $1
-         ORDER BY time DESC
-         LIMIT 30
-       )
-       ORDER BY time ASC`,
+      `SELECT DISTINCT ON (DATE_TRUNC('day', time)) time, open, high, low, close, volume
+       FROM (
+         (
+           SELECT time, open, high, low, close, volume
+           FROM stock_prices_history
+           WHERE ticker = $1
+           ORDER BY time DESC
+           -- Không LIMIT: lấy toàn bộ lịch sử đã crawl
+         )
+         UNION
+         (
+           SELECT time, open, high, low, close, volume
+           FROM stock_prices
+           WHERE ticker = $1
+           ORDER BY time DESC
+           LIMIT 90   -- realtime: chỉ cần 90 ngày gần nhất
+         )
+       ) combined
+       ORDER BY DATE_TRUNC('day', time) ASC, time ASC`,
       [symbol],
     );
 
@@ -125,15 +128,39 @@ export async function GET(
         ipoDate:            info.ipo_date,
         ipoPrice:           info.ipo_price,
       },
-      history: history.map((h) => ({
-        date:      h.time.split('T')[0],
-        open:      h.open,
-        high:      h.high,
-        low:       h.low,
-        close:     h.close,
-        adClose:   h.close,
-        nmVolume:  h.volume,
-      })),
+      // Dedup theo date string + sort ASC — bảo vệ thứ 2 cho lightweight-charts
+      history: (() => {
+        const seen = new Set<string>();
+        return history
+          .map((h) => {
+            // pg DECIMAL → string, parse về number trước
+            const rawClose  = parseFloat(String(h.close  ?? 0));
+            const rawOpen   = parseFloat(String(h.open   ?? rawClose));
+            const rawHigh   = parseFloat(String(h.high   ?? rawClose));
+            const rawLow    = parseFloat(String(h.low    ?? rawClose));
+
+            // Normalize về đơn vị nghìn đồng:
+            // quote.history() trả full VND (VD: 23500), price_board() trả nghìn đồng (23.5)
+            // Nếu close > 1000 → đang ở full VND → chia 1000
+            const factor = rawClose > 1000 ? 1000 : 1;
+
+            return {
+              date:     new Date(h.time).toISOString().split('T')[0],
+              open:     Math.round((rawOpen  / factor) * 100) / 100,
+              high:     Math.round((rawHigh  / factor) * 100) / 100,
+              low:      Math.round((rawLow   / factor) * 100) / 100,
+              close:    Math.round((rawClose / factor) * 100) / 100,
+              adClose:  Math.round((rawClose / factor) * 100) / 100,
+              nmVolume: Number(h.volume ?? 0),
+            };
+          })
+          .filter((d) => {
+            if (seen.has(d.date)) return false;
+            seen.add(d.date);
+            return true;
+          })
+          .sort((a, b) => a.date.localeCompare(b.date));
+      })(),
       indicators: indicators ?? null,
       risk,
     });

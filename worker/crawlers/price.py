@@ -1,26 +1,21 @@
 """
 worker/crawlers/price.py — Real-time price crawler
-Fetch giá từ VNDirect API, lưu DB, cache Redis, publish Pub/Sub
+Fetch giá từ VCI (qua vnstock) thay cho VNDirect (bị block trong Docker).
+VCI không yêu cầu API key, hoạt động ổn định trong môi trường server/container.
+
+Flow: vnstock VCI → upsert PostgreSQL → cache Redis → publish Pub/Sub SSE
 """
 
-import json
 import logging
 from datetime import datetime, timezone
 
-import httpx
-
 from db import Database, execute_many, get_redis, PRICE_CHANNEL
+import json
 
 logger = logging.getLogger(__name__)
 
-VNDIRECT_API = "https://finfo-api.vndirect.com.vn/v4"
-HEADERS = {
-    "Accept": "application/json",
-    "User-Agent": "Mozilla/5.0 (compatible; SSI-Worker/1.0)",
-}
-
-# Timeout request (giây)
-REQUEST_TIMEOUT = 5
+# Số mã tối đa mỗi batch gọi price_board
+CHUNK_SIZE = 50
 
 
 def get_active_tickers() -> list[str]:
@@ -30,43 +25,68 @@ def get_active_tickers() -> list[str]:
     return [r["ticker"] for r in rows]
 
 
-def fetch_prices_from_vndirect(tickers: list[str]) -> list[dict]:
+def fetch_prices_from_vci(tickers: list[str]) -> list[dict]:
     """
-    Gọi VNDirect API lấy giá mới nhất của nhiều mã cùng lúc.
-    API trả về price mới nhất theo ngày (không phải tick-by-tick).
+    Dùng vnstock (VCI source) để lấy price board nhiều mã cùng lúc.
+    Trả về list dict chuẩn hóa với keys: code, open, high, low, close, volume, ref_price, date
     """
     if not tickers:
         return []
 
-    # Build query: code:VNM~code:VCB~...
-    # VNDirect hỗ trợ tối đa 50 mã/request
-    chunk_size = 50
-    all_prices = []
+    try:
+        from vnstock import Vnstock
+    except ImportError:
+        logger.error("vnstock chưa được cài — chạy: pip install vnstock")
+        return []
 
-    for i in range(0, len(tickers), chunk_size):
-        chunk = tickers[i : i + chunk_size]
-        query = "~".join(f"code:{t}" for t in chunk)
+    all_data: list[dict] = []
 
+    # Chia nhỏ để tránh timeout nếu quá nhiều mã
+    for i in range(0, len(tickers), CHUNK_SIZE):
+        chunk = tickers[i: i + CHUNK_SIZE]
         try:
-            with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
-                resp = client.get(
-                    f"{VNDIRECT_API}/stockPrices",
-                    params={
-                        "sort": "-date",
-                        "q": query,
-                        "size": len(chunk),
-                        "fields": "code,date,close,open,high,low,nmVolume,pricePreviousClose,percentPriceChange",
-                    },
-                    headers=HEADERS,
-                )
-                resp.raise_for_status()
-                data = resp.json().get("data", [])
-                all_prices.extend(data)
+            stock = Vnstock().stock(symbol=chunk[0], source="VCI")
+            df = stock.trading.price_board(chunk)
 
-        except (httpx.RequestError, httpx.HTTPStatusError) as e:
-            logger.warning(f"VNDirect API error for chunk {chunk[:3]}...: {e}")
+            if df is None or df.empty:
+                logger.warning(f"VCI: No data for chunk {chunk[:3]}...")
+                continue
 
-    return all_prices
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+            for _, row in df.iterrows():
+                try:
+                    code      = str(row[("listing", "symbol")]).upper()
+                    open_p    = _to_price(row.get(("match", "open_price")))
+                    high_p    = _to_price(row.get(("match", "highest")))
+                    low_p     = _to_price(row.get(("match", "lowest")))
+                    close_p   = _to_price(row.get(("match", "match_price")))
+                    volume    = int(row.get(("match", "accumulated_volume")) or 0)
+                    ref_price = _to_price(row.get(("listing", "ref_price")))
+
+                    # Tính % thay đổi so với giá tham chiếu
+                    pct_change = 0.0
+                    if close_p and ref_price and ref_price > 0:
+                        pct_change = round((close_p - ref_price) / ref_price * 100, 2)
+
+                    all_data.append({
+                        "code":               code,
+                        "date":               today,
+                        "open":               open_p,
+                        "high":               high_p,
+                        "low":                low_p,
+                        "close":              close_p,
+                        "volume":             volume,
+                        "pricePreviousClose": ref_price,
+                        "percentPriceChange": pct_change,
+                    })
+                except Exception as e:
+                    logger.debug(f"VCI: skip row error — {e}")
+
+        except Exception as e:
+            logger.warning(f"VCI API error for chunk {chunk[:3]}...: {e}")
+
+    return all_data
 
 
 def upsert_prices_to_db(prices: list[dict]) -> int:
@@ -83,13 +103,13 @@ def upsert_prices_to_db(prices: list[dict]) -> int:
     for p in prices:
         try:
             rows.append((
-                now,                        # time (dùng now vì là real-time tick)
-                p["code"].upper(),          # ticker
-                _parse_price(p.get("open")),
-                _parse_price(p.get("high")),
-                _parse_price(p.get("low")),
-                _parse_price(p.get("close")),
-                int(p.get("nmVolume") or 0),
+                now,
+                p["code"].upper(),
+                p.get("open"),
+                p.get("high"),
+                p.get("low"),
+                p.get("close"),
+                int(p.get("volume") or 0),
             ))
         except (KeyError, TypeError, ValueError) as e:
             logger.debug(f"Skip malformed price record: {e}")
@@ -113,12 +133,11 @@ def upsert_prices_to_db(prices: list[dict]) -> int:
 
 def cache_and_publish(prices: list[dict]) -> None:
     """
-    Cache từng mã vào Redis + publish event batch lên channel.
-    Next.js SSE endpoint subscribe channel này.
+    Cache từng mã vào Redis (TTL 70s = đủ sống qua 1 chu kỳ crawl 1 phút)
+    + publish event batch lên channel cho Next.js SSE endpoint.
     """
     r = get_redis()
     pipe = r.pipeline()
-
     publish_data = []
 
     for p in prices:
@@ -127,35 +146,33 @@ def cache_and_publish(prices: list[dict]) -> None:
             continue
 
         price_data = {
-            "code": ticker,
-            "close": _parse_price(p.get("close")),
-            "open": _parse_price(p.get("open")),
-            "high": _parse_price(p.get("high")),
-            "low": _parse_price(p.get("low")),
-            "volume": int(p.get("nmVolume") or 0),
-            "pricePreviousClose": _parse_price(p.get("pricePreviousClose")),
-            "percentPriceChange": float(p.get("percentPriceChange") or 0),
-            "updatedAt": datetime.now(timezone.utc).isoformat(),
+            "code":               ticker,
+            "close":              p.get("close"),
+            "open":               p.get("open"),
+            "high":               p.get("high"),
+            "low":                p.get("low"),
+            "volume":             p.get("volume", 0),
+            "pricePreviousClose": p.get("pricePreviousClose"),
+            "percentPriceChange": p.get("percentPriceChange", 0.0),
+            "updatedAt":          datetime.now(timezone.utc).isoformat(),
         }
 
-        # Cache 10 giây
-        pipe.setex(f"price:{ticker}", 10, json.dumps(price_data))
+        pipe.setex(f"price:{ticker}", 70, json.dumps(price_data))
         publish_data.append(price_data)
 
     pipe.execute()
 
-    # Publish một message chứa tất cả giá (giảm số lần publish)
     if publish_data:
         r.publish(PRICE_CHANNEL, json.dumps({
-            "prices": publish_data,
+            "prices":    publish_data,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }))
 
 
 def crawl_prices() -> None:
     """
-    Main function — được gọi bởi scheduler.
-    Flow: fetch → upsert DB → cache + publish Redis
+    Main function — được gọi bởi scheduler mỗi 1 phút (giờ giao dịch).
+    Flow: fetch VCI → log → upsert DB → cache + publish Redis
     """
     try:
         tickers = get_active_tickers()
@@ -163,23 +180,43 @@ def crawl_prices() -> None:
             logger.warning("No active tickers found in DB")
             return
 
-        prices = fetch_prices_from_vndirect(tickers)
+        logger.info(f"[VCI] Fetching {len(tickers)} tickers: {tickers[:10]}{'...' if len(tickers) > 10 else ''}")
+
+        prices = fetch_prices_from_vci(tickers)
         if not prices:
-            logger.warning("No price data returned from VNDirect")
+            logger.warning("[VCI] No price data returned")
             return
+
+        # ─── Log chi tiết từng mã fetch về ────────────────────────────────────
+        logger.info(f"[VCI] Received {len(prices)} records:")
+        for p in prices:
+            code  = p.get("code", "?")
+            date  = p.get("date", "?")
+            o     = p.get("open", "N/A")
+            h     = p.get("high", "N/A")
+            l     = p.get("low",  "N/A")
+            c     = p.get("close", "N/A")
+            vol   = p.get("volume", 0)
+            pct   = p.get("percentPriceChange", 0)
+            ref   = p.get("pricePreviousClose", "N/A")
+            logger.info(
+                f"  {code:6s} | {date} | ref={ref} O={o} H={h} L={l} C={c}"
+                f" | vol={vol:,} | chg={pct:+.2f}%"
+            )
 
         count = upsert_prices_to_db(prices)
         cache_and_publish(prices)
 
-        logger.info(f"crawl_prices: {count} records updated, {len(prices)} published")
+        logger.info(f"[DB] Upserted {count} records | [Redis] Published {len(prices)} prices")
 
     except Exception as e:
         logger.error(f"crawl_prices failed: {e}", exc_info=True)
 
 
-def _parse_price(value) -> float | None:
+def _to_price(value) -> float | None:
     """Parse giá trị giá — trả về None nếu không hợp lệ."""
     try:
-        return float(value) if value is not None else None
+        v = float(value)
+        return v if v > 0 else None
     except (TypeError, ValueError):
         return None

@@ -82,8 +82,13 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       ENVIRONMENT: ${ENVIRONMENT:-development}
       API_PORT: 8000
+      TZ: Asia/Ho_Chi_Minh
+      BYPASS_TRADING_HOURS: "true"  # Xóa dòng này khi deploy production
     ports:
       - '8000:8000'
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     depends_on:
       postgres:
         condition: service_healthy

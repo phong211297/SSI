@@ -26,14 +26,65 @@ interface StockDetailProps {
 const RISK_COLORS = { low: '#22c55e', medium: '#f59e0b', high: '#ef4444' };
 const RISK_LABELS = { low: 'THẤP', medium: 'TRUNG BÌNH', high: 'CAO' };
 
-const TIME_RANGES = [
-  { label: '1T', days: 5 },
-  { label: '1M', days: 22 },
-  { label: '3M', days: 66 },
-  { label: '6M', days: 132 },
-  { label: '1Y', days: 252 },
-  { label: 'Tất cả', days: 9999 },
+// ─── Candle resolution config ─────────────────────────────────────────────────
+type Resolution = '1D' | '1W' | '1M' | '3M' | '1Y';
+
+const RESOLUTIONS: { label: Resolution; get: (date: string) => string }[] = [
+  // group key = date itself
+  { label: '1D', get: (d) => d },
+  // group key = ISO week (YYYY-Www)
+  { label: '1W', get: (d) => {
+    const dt = new Date(d);
+    const jan4 = new Date(dt.getFullYear(), 0, 4);
+    const week = Math.ceil(((dt.getTime() - jan4.getTime()) / 86400000 + jan4.getDay() + 1) / 7);
+    return `${dt.getFullYear()}-W${String(week).padStart(2, '0')}`;
+  }},
+  // group key = YYYY-MM
+  { label: '1M', get: (d) => d.slice(0, 7) },
+  // group key = YYYY-Q#
+  { label: '3M', get: (d) => `${d.slice(0, 4)}-Q${Math.ceil(Number(d.slice(5, 7)) / 3)}` },
+  // group key = YYYY
+  { label: '1Y', get: (d) => d.slice(0, 4) },
 ];
+
+interface OHLCPoint {
+  date: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+/** Gộp daily data thành nến theo resolution */
+function aggregateByResolution(daily: OHLCPoint[], resolution: Resolution): OHLCPoint[] {
+  if (resolution === '1D') return daily;
+
+  const res = RESOLUTIONS.find(r => r.label === resolution)!;
+  const groups = new Map<string, OHLCPoint[]>();
+
+  for (const d of daily) {
+    const key = res.get(d.date);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(d);
+  }
+
+  const result: OHLCPoint[] = [];
+  for (const [, bars] of groups) {
+    if (!bars.length) continue;
+    // Lấy ngày đầu tiên của group làm date key cho nến gộp
+    result.push({
+      date:   bars[0].date,
+      open:   bars[0].open,
+      high:   Math.max(...bars.map(b => b.high)),
+      low:    Math.min(...bars.map(b => b.low)),
+      close:  bars[bars.length - 1].close,
+      volume: bars.reduce((s, b) => s + b.volume, 0),
+    });
+  }
+
+  return result.sort((a, b) => a.date.localeCompare(b.date));
+}
 
 const CHART_TYPES = [
   { label: 'Nến', value: 'candlestick' },
@@ -46,7 +97,7 @@ type ChartType = typeof CHART_TYPES[number]['value'];
 
 export default function StockDetail({ ticker, onAskAI }: StockDetailProps) {
   const [data, setData] = useState<any>(null);
-  const [selectedRange, setSelectedRange] = useState('3M');
+  const [resolution, setResolution] = useState<Resolution>('1D');
   const [chartType, setChartType] = useState<ChartType>('candlestick');
   const [loading, setLoading] = useState(false);
 
@@ -81,19 +132,21 @@ export default function StockDetail({ ticker, onAskAI }: StockDetailProps) {
 
   if (!data) return null;
 
-  const { info, history, risk }: { info: any; history: any[]; risk: RiskData } = data;
+  const { info, history: rawHistory, risk }: { info: any; history: any[]; risk: RiskData } = data;
+  const history: any[] = Array.isArray(rawHistory) ? rawHistory : [];
 
-  const rangeDays = TIME_RANGES.find(r => r.label === selectedRange)?.days ?? 66;
-  const slicedHistory = rangeDays >= 9999 ? history : history.slice(-rangeDays);
+  // Map daily data sang OHLCPoint (normalize number, API đã normalize đơn vị)
+  const dailyData: OHLCPoint[] = history.map((h: any) => ({
+    date:   h.date?.slice(0, 10) ?? '',
+    open:   Number(h.open    || h.close   || 0),
+    high:   Number(h.high    || h.close   || 0),
+    low:    Number(h.low     || h.close   || 0),
+    close:  Number(h.close   || h.adClose || 0),
+    volume: Number(h.nmVolume ?? 0),
+  })).filter(d => d.date && d.close > 0);
 
-  const chartData = slicedHistory.map((h: any) => ({
-    date: h.date?.slice(0, 10) ?? '',
-    open: (h.open || h.close || 0) / 1000,
-    high: (h.high || h.close || 0) / 1000,
-    low: (h.low || h.close || 0) / 1000,
-    close: (h.close || h.adClose || 0) / 1000,
-    volume: h.nmVolume ?? 0,
-  }));
+  // Aggregate theo resolution được chọn
+  const chartData = aggregateByResolution(dailyData, resolution);
 
   const currentPrice = info?.close ?? risk?.currentPrice ?? 0;
   const pctChange = info?.percentPriceChange ?? 0;
@@ -165,11 +218,11 @@ export default function StockDetail({ ticker, onAskAI }: StockDetailProps) {
               ))}
             </div>
             <div className={styles.timeRanges}>
-              {TIME_RANGES.map(r => (
+              {RESOLUTIONS.map(r => (
                 <button
                   key={r.label}
-                  className={`${styles.rangeBtn} ${selectedRange === r.label ? styles.rangeBtnActive : ''}`}
-                  onClick={() => setSelectedRange(r.label)}
+                  className={`${styles.rangeBtn} ${resolution === r.label ? styles.rangeBtnActive : ''}`}
+                  onClick={() => setResolution(r.label)}
                 >
                   {r.label}
                 </button>
@@ -178,8 +231,7 @@ export default function StockDetail({ ticker, onAskAI }: StockDetailProps) {
           </div>
 
           <div className={styles.chartMeta}>
-            {chartData.length} phiên
-            {selectedRange === 'Tất cả' && data?.ipoDate && ` · Từ ${data.ipoDate}`}
+            {chartData.length} nến · {resolution} resolution
           </div>
 
           <TradingChart data={chartData} chartType={chartType} height={260} />

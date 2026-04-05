@@ -29,12 +29,11 @@ interface TradingChartProps {
 
 export default function TradingChart({ data, chartType, height = 280 }: TradingChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const chartRef = useRef<IChartApi | null>(null);
+  const chartRef     = useRef<IChartApi | null>(null);
 
   useEffect(() => {
     if (!containerRef.current || data.length === 0) return;
 
-    // Cleanup previous chart
     if (chartRef.current) {
       chartRef.current.remove();
       chartRef.current = null;
@@ -63,9 +62,8 @@ export default function TradingChart({ data, chartType, height = 280 }: TradingC
         borderColor: '#1e2d45',
         timeVisible: true,
         secondsVisible: false,
-        barSpacing: 10,
-        minBarSpacing: 1,
-        rightOffset: 5,
+        minBarSpacing: 0.5,   // cho phép nén nến tối đa
+        rightOffset: 3,
       },
       handleScroll: true,
       handleScale: true,
@@ -75,86 +73,98 @@ export default function TradingChart({ data, chartType, height = 280 }: TradingC
 
     chartRef.current = chart;
 
-    // ---- Data formats for each series type ----
-    // CandlestickSeries requires: { time, open, high, low, close }
-    const ohlcData = data.map(d => ({
-      time: d.date as Time,
-      open: d.open,
-      high: d.high,
-      low: d.low,
+    // Dedup + sort ASC — lightweight-charts yêu cầu time tăng dần tuyệt đối
+    const dedupedMap = new Map<string, OHLCPoint>();
+    for (const d of data) {
+      if (d.date) dedupedMap.set(d.date, d);
+    }
+    const sorted = Array.from(dedupedMap.values()).sort((a, b) =>
+      a.date.localeCompare(b.date),
+    );
+
+    if (sorted.length === 0) return;
+
+    const ohlcData = sorted.map(d => ({
+      time:  d.date as Time,
+      open:  d.open,
+      high:  d.high,
+      low:   d.low,
       close: d.close,
     }));
 
-    // AreaSeries / LineSeries require: { time, value }
-    const lineData = data.map(d => ({
-      time: d.date as Time,
+    const lineData = sorted.map(d => ({
+      time:  d.date as Time,
       value: d.close,
     }));
 
-    // Volume histogram: { time, value, color }
-    const volumeData = data.map(d => ({
-      time: d.date as Time,
+    const volumeData = sorted.map(d => ({
+      time:  d.date as Time,
       value: d.volume / 1_000_000,
       color: d.close >= d.open ? '#22c55e55' : '#ef444455',
     }));
 
-    // ---- Add main series ----
+    // ---- Main series ----
     if (chartType === 'candlestick') {
       const series = chart.addSeries(CandlestickSeries, {
-        upColor: '#22c55e',
-        downColor: '#ef4444',
-        borderVisible: false,          // No border → solid body matching wick color
-        wickUpColor: '#22c55e',
+        priceScaleId:  'right',
+        upColor:       '#22c55e',
+        downColor:     '#ef4444',
+        borderVisible: false,
+        wickUpColor:   '#22c55e',
         wickDownColor: '#ef4444',
       });
       series.setData(ohlcData);
 
     } else if (chartType === 'area') {
       const series = chart.addSeries(AreaSeries, {
-        lineColor: '#818cf8',
-        topColor: 'rgba(129, 140, 248, 0.35)',
-        bottomColor: 'rgba(129, 140, 248, 0.02)',
+        priceScaleId: 'right',
+        lineColor:    '#818cf8',
+        topColor:     'rgba(129, 140, 248, 0.35)',
+        bottomColor:  'rgba(129, 140, 248, 0.02)',
         lineWidth: 2,
       });
       series.setData(lineData);
 
     } else if (chartType === 'line') {
       const series = chart.addSeries(LineSeries, {
-        color: '#22d3ee',
+        priceScaleId: 'right',
+        color:        '#22d3ee',
         lineWidth: 2,
       });
       series.setData(lineData);
 
     } else {
-      // 'bar' — histogram of closing prices colored by direction
       const series = chart.addSeries(HistogramSeries, {
         priceScaleId: 'right',
-        priceFormat: { type: 'price', precision: 1, minMove: 0.1 },
+        priceFormat:  { type: 'price', precision: 1, minMove: 0.1 },
       });
-      series.setData(data.map(d => ({
-        time: d.date as Time,
+      series.setData(sorted.map(d => ({
+        time:  d.date as Time,
         value: d.close,
         color: d.close >= d.open ? '#22c55e' : '#ef4444',
       })));
     }
 
-    // ---- Volume series (always shown at bottom) ----
+    // ---- Volume series — tách biệt scale, ẩn label ----
     const volumeSeries = chart.addSeries(HistogramSeries, {
-      priceFormat: { type: 'volume' },
-      priceScaleId: 'vol',
+      priceFormat:      { type: 'volume' },
+      priceScaleId:     'vol',
+      lastValueVisible: false,
     });
     chart.priceScale('vol').applyOptions({
       scaleMargins: { top: 0.84, bottom: 0 },
+      visible: false,
     });
     volumeSeries.setData(volumeData);
 
-    // Show most recent candles at proper barSpacing (fitContent() would override barSpacing)
-    chart.timeScale().scrollToRealTime();
+    // fitContent: tự điều chỉnh barSpacing để vừa hiển thị hết tất cả nến
+    chart.timeScale().fitContent();
 
     // Responsive resize
     const observer = new ResizeObserver(() => {
       if (containerRef.current && chartRef.current) {
         chartRef.current.applyOptions({ width: containerRef.current.clientWidth });
+        chartRef.current.timeScale().fitContent();
       }
     });
     observer.observe(containerRef.current);

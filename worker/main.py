@@ -7,7 +7,7 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 import uvicorn
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -27,16 +27,19 @@ logger = logging.getLogger("worker.main")
 
 # ─── Import jobs ──────────────────────────────────────────────────────────────
 from crawlers.price import crawl_prices
+from crawlers.history import backfill_all
 from processors.indicators import calc_indicators_for_all
+
+ICT = timezone(timedelta(hours=7))  # Asia/Ho_Chi_Minh — UTC+7
 
 
 def is_trading_hours() -> bool:
     """
     Kiểm tra giờ giao dịch HOSE/HNX.
     Thứ 2-6, 9:00-15:00 ICT (UTC+7)
+    Dùng timezone-aware datetime để tránh sai lệch khi chạy trong Docker (UTC).
     """
-    now = datetime.now()
-    # APScheduler runs in local time — đảm bảo server đặt timezone Asia/Ho_Chi_Minh
+    now = datetime.now(ICT)                 # Luôn lấy giờ ICT, bất kể TZ của container
     is_weekday = now.weekday() < 5          # Mon=0 ... Fri=4
     hour = now.hour
     minute = now.minute
@@ -45,11 +48,15 @@ def is_trading_hours() -> bool:
 
 
 def safe_crawl_prices():
-    """Chỉ crawl giá trong giờ giao dịch."""
-    if is_trading_hours():
+    """Chỉ crawl giá trong giờ giao dịch. Set BYPASS_TRADING_HOURS=true để force chạy khi test."""
+    bypass = os.environ.get("BYPASS_TRADING_HOURS", "false").lower() == "true"
+    if bypass:
+        logger.info("[DEV] BYPASS_TRADING_HOURS=true — force crawling outside trading hours")
+        crawl_prices()
+    elif is_trading_hours():
         crawl_prices()
     else:
-        logger.debug("Outside trading hours — skipping price crawl")
+        logger.info("Outside trading hours (ICT 9:00-15:00 Mon-Fri) — skipping price crawl")
 
 
 def safe_calc_indicators():
@@ -83,15 +90,15 @@ def main():
 
     scheduler = BlockingScheduler(timezone="Asia/Ho_Chi_Minh")
 
-    # ─── Giá real-time: mỗi 5 giây (trong giờ giao dịch) ─────────────────────
+    # ─── Giá real-time: mỗi 1 phút (trong giờ giao dịch) ───────────────────────
     scheduler.add_job(
         safe_crawl_prices,
-        trigger=IntervalTrigger(seconds=5),
+        trigger=IntervalTrigger(minutes=1),
         id="price_crawler",
         name="Real-time Price Crawler",
         max_instances=1,
         coalesce=True,
-        misfire_grace_time=10,
+        misfire_grace_time=30,
     )
 
     # ─── Chỉ số kỹ thuật: mỗi 5 phút ────────────────────────────────────────
@@ -105,14 +112,25 @@ def main():
         misfire_grace_time=120,
     )
 
-    # ─── Khởi động: chạy ngay lần đầu khi worker bắt đầu ────────────────────
+    # ─── Khởi động: backfill lịch sử trước, rồi chạy các job ban đầu ─────────
     logger.info("Running initial jobs on startup...")
+
+    # 1. Backfill lịch sử  năm (bỏ qua nếu đã có đủ data)
+    try:
+        logger.info("[History] Starting historical data backfill (5 years)...")
+        result = backfill_all(years=30, force=True)
+        logger.info(f"✓ History backfill done: {result}")
+    except Exception as e:
+        logger.warning(f"History backfill failed (non-critical): {e}")
+
+    # 2. Crawl giá real-time
     try:
         safe_crawl_prices()
         logger.info("✓ Initial price crawl done")
     except Exception as e:
         logger.warning(f"Initial price crawl failed (will retry on schedule): {e}")
 
+    # 3. Tính chỉ số kỹ thuật (sau khi đã có lịch sử)
     try:
         safe_calc_indicators()
         logger.info("✓ Initial indicator calculation done")
@@ -121,7 +139,7 @@ def main():
 
     # ─── Start ────────────────────────────────────────────────────────────────
     logger.info("━━━ Scheduler started ━━━")
-    logger.info("  • Price crawler:       every 5s (trading hours only)")
+    logger.info("  • Price crawler:       every 1min (trading hours only)")
     logger.info("  • Indicator calc:      every 5min")
     logger.info(f"  • FastAPI sidecar:    http://0.0.0.0:{api_port}/docs")
     logger.info("Press Ctrl+C to stop")
